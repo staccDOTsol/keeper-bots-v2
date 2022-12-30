@@ -16,7 +16,7 @@ import {
 	PerpMarkets,
 } from '@drift-labs/sdk';
 import { Mutex, tryAcquire, E_ALREADY_LOCKED } from 'async-mutex';
-
+import fs from 'fs';
 import { logger } from '../logger';
 import { Bot } from '../types';
 import { Metrics } from '../metrics';
@@ -234,33 +234,54 @@ export class FloatingPerpMakerBot implements Bot {
 		if (placeNewOrders) {
 			const biasNum = new BN(90);
 			const biasDenom = new BN(100);
+			const hedgin = JSON.parse(fs.readFileSync('../sizes.json').toString());
+			let amt;
+			if (marketIndex == 0) {
+				amt = hedgin['SOL'];
+			}
+			if (marketIndex == 1) {
+				amt = hedgin['BTC'];
+			}
+			if (marketIndex == 2) {
+				amt = hedgin['ETH'];
+			}
+			if (amt < 0) {
+				try {
+					const oracleBidSpread = oracle.price.sub(vBid);
+					const tx0 = await this.clearingHouse.placePerpOrder({
+						marketIndex: marketIndex,
+						orderType: OrderType.LIMIT,
+						direction: PositionDirection.LONG,
 
-			const oracleBidSpread = oracle.price.sub(vBid);
-			const tx0 = await this.clearingHouse.placePerpOrder({
-				marketIndex: marketIndex,
-				orderType: OrderType.LIMIT,
-				direction: PositionDirection.LONG,
-				baseAssetAmount: BASE_PRECISION.mul(new BN(1)),
-				oraclePriceOffset: oracleBidSpread
-					.mul(biasNum)
-					.div(biasDenom)
-					.neg()
-					.toNumber(), // limit bid below oracle
-			});
-			console.log(`${this.name} placing long: ${tx0}`);
-
-			const oracleAskSpread = vAsk.sub(oracle.price);
-			const tx1 = await this.clearingHouse.placePerpOrder({
-				marketIndex: marketIndex,
-				orderType: OrderType.LIMIT,
-				direction: PositionDirection.SHORT,
-				baseAssetAmount: BASE_PRECISION.mul(new BN(1)),
-				oraclePriceOffset: oracleAskSpread
-					.mul(biasNum)
-					.div(biasDenom)
-					.toNumber(), // limit ask above oracle
-			});
-			console.log(`${this.name} placing short: ${tx1}`);
+						baseAssetAmount: BASE_PRECISION.mul(new BN((-1 * amt) / 10)),
+						oraclePriceOffset: oracleBidSpread
+							.mul(biasNum)
+							.div(biasDenom)
+							.neg()
+							.toNumber(), // limit bid below oracle
+					});
+					console.log(`${this.name} placing long: ${tx0}`);
+				} catch (err) {
+					console.log(err);
+				}
+			} else if (amt > 0) {
+				try {
+					const oracleAskSpread = vAsk.sub(oracle.price);
+					const tx1 = await this.clearingHouse.placePerpOrder({
+						marketIndex: marketIndex,
+						orderType: OrderType.LIMIT,
+						direction: PositionDirection.SHORT,
+						baseAssetAmount: BASE_PRECISION.mul(new BN(amt / 10)),
+						oraclePriceOffset: oracleAskSpread
+							.mul(biasNum)
+							.div(biasDenom)
+							.toNumber(), // limit ask above oracle
+					});
+					console.log(`${this.name} placing short: ${tx1}`);
+				} catch (err) {
+					console.log(err);
+				}
+			}
 		}
 
 		// enforce cooldown on market

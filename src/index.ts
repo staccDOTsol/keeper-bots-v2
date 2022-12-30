@@ -57,7 +57,7 @@ const commitHash = process.env.COMMIT;
 //@ts-ignore
 const sdkConfig = initialize({ env: process.env.ENV });
 
-const stateCommitment: Commitment = 'confirmed';
+const stateCommitment: Commitment = 'processed';
 const healthCheckPort = process.env.HEALTH_CHECK_PORT || 8888;
 const metricsPort =
 	process.env.METRICS_PORT ||
@@ -265,14 +265,14 @@ const runBot = async () => {
 			return { publicKey: mkt.oracle, source: mkt.oracleSource };
 		}),
 		accountSubscription: {
-			// type: 'websocket'
-			type: 'polling',
-			accountLoader: bulkAccountLoader,
+			type: 'websocket',
+			//	type: 'polling',
+			//		accountLoader: bulkAccountLoader,
 		},
 		env: driftEnv,
 		userStats: true,
 	});
-
+	await driftClient.accountSubscriber.subscribe();
 	const eventSubscriber = new EventSubscriber(connection, driftClient.program, {
 		maxTx: 8192,
 		maxEventsPerType: 8192,
@@ -280,12 +280,11 @@ const runBot = async () => {
 		orderDir: 'desc',
 		commitment: stateCommitment,
 		logProviderConfig: {
-			type: 'polling',
-			frequency: 1000,
-			// type: 'websocket',
+			//type: 'polling',
+			//frequency: 1000,
+			type: 'websocket',
 		},
 	});
-
 	const slotSubscriber = new SlotSubscriber(connection, {});
 	const lastSlotReceivedMutex = new Mutex();
 	let lastSlotReceived: number;
@@ -616,7 +615,7 @@ const runBot = async () => {
 					return;
 				}
 
-				if (bulkAccountLoader) {
+				if (false) {
 					// we expect health checks to happen at a rate slower than the BulkAccountLoader's polling frequency
 					if (
 						lastBulkAccountLoaderSlot &&

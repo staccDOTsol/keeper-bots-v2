@@ -1,6 +1,14 @@
 import {
+	AccountService,
+	Reserve,
+	FLASH_LOAN_ID,
+} from '@texture-finance/solana-flash-loan-sdk';
+
+import {
 	BN,
 	isVariant,
+	calculateAskPrice,
+	calculateBidPrice,
 	DriftClient,
 	PerpMarketAccount,
 	SlotSubscriber,
@@ -23,13 +31,23 @@ import {
 } from '@drift-labs/sdk';
 import { Mutex, tryAcquire, withTimeout, E_ALREADY_LOCKED } from 'async-mutex';
 
-import { TransactionSignature, PublicKey } from '@solana/web3.js';
-
+import {
+	TransactionSignature,
+	PublicKey,
+	Transaction,
+	Keypair,
+	Connection,
+} from '@solana/web3.js';
 import { getErrorCode } from '../error';
 import { logger } from '../logger';
 import { Bot } from '../types';
 import { Metrics } from '../metrics';
-
+import fs from 'fs';
+import { bs58 } from '@project-serum/anchor/dist/cjs/utils/bytes';
+import {
+	ASSOCIATED_TOKEN_PROGRAM_ID,
+	TOKEN_PROGRAM_ID,
+} from '@solana/spl-token';
 type Action = {
 	baseAssetAmount: BN;
 	marketIndex: number;
@@ -80,9 +98,11 @@ export class JitMakerBot implements Bot {
 	private slotSubscriber: SlotSubscriber;
 	private dlobMutex = withTimeout(
 		new Mutex(),
-		10 * this.defaultIntervalMs,
+		this.defaultIntervalMs,
 		dlobMutexError
 	);
+	start: number = new Date().getTime();
+	total: number = 0;
 	private dlob: DLOB;
 	private periodicTaskMutex = new Mutex();
 	private userMap: UserMap;
@@ -106,13 +126,12 @@ export class JitMakerBot implements Bot {
 	 * if a position's notional value passes this percentage of account
 	 * collateral, the position enters a CLOSING_* state.
 	 */
-	private MAX_POSITION_EXPOSURE = 0.1;
+	private MAX_POSITION_EXPOSURE = 100000000000000000000;
 
 	/**
 	 * The max amount of quote to spend on each order.
 	 */
-	private MAX_TRADE_SIZE_QUOTE = 1000;
-
+	private MAX_TRADE_SIZE_QUOTE = 100000000000000000000;
 	constructor(
 		name: string,
 		dryRun: boolean,
@@ -130,7 +149,7 @@ export class JitMakerBot implements Bot {
 	public async init() {
 		logger.info(`${this.name} initing`);
 		const initPromises: Array<Promise<any>> = [];
-
+		initPromises.push(this.clearingHouse.subscribe());
 		this.userMap = new UserMap(
 			this.clearingHouse,
 			this.clearingHouse.userAccountSubscriptionConfig
@@ -188,12 +207,17 @@ export class JitMakerBot implements Bot {
 
 	public async trigger(record: any): Promise<void> {
 		if (record.eventType === 'OrderRecord') {
-			await this.userMap.updateWithOrderRecord(record as OrderRecord);
-			await this.userStatsMap.updateWithOrderRecord(
-				record as OrderRecord,
-				this.userMap
-			);
-			await this.tryMake();
+			try {
+				await this.userMap.updateWithOrderRecord(record as OrderRecord);
+				await this.userStatsMap.updateWithOrderRecord(
+					record as OrderRecord,
+					this.userMap
+				);
+				await this.tryMake();
+			} catch {
+				console.log(1);
+				await this.tryMake();
+			}
 		} else if (record.eventType === 'NewUserRecord') {
 			await this.userMap.mustGet((record as NewUserRecord).user.toString());
 			await this.userStatsMap.mustGet(
@@ -405,7 +429,13 @@ export class JitMakerBot implements Bot {
 	 * Draws an action based on the current state of the bot.
 	 *
 	 */
-	private async drawAndExecuteAction(market: PerpMarketAccount) {
+	async drawAndExecuteAction(market: PerpMarketAccount) {
+		const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+		this.clearingHouse.connection = new Connection(
+			process.env.ALT_RPC_LIST.split(',')[
+				Math.floor(Math.random() * process.env.ALT_RPC_LIST.split(',').length)
+			]
+		);
 		// get nodes available to fill in the jit auction
 		const nodesToFill = this.dlob.findJitAuctionNodesToFill(
 			market.marketIndex,
@@ -426,7 +456,7 @@ export class JitMakerBot implements Bot {
 			logger.info(
 				`node slot: ${
 					nodeToFill.node.order.slot
-				}, cur slot: ${this.slotSubscriber.getSlot()}`
+				}, cur slot: ${await this.slotSubscriber.getSlot()}`
 			);
 			this.orderLastSeenBaseAmount.set(
 				getOrderSignature(
@@ -455,72 +485,97 @@ export class JitMakerBot implements Bot {
 				? PositionDirection.SHORT
 				: PositionDirection.LONG;
 
-			const jitMakerPrice = nodeToFill.node.order.auctionStartPrice;
+			const oracle =
+				this.clearingHouse.getOracleDataForPerpMarket(orderMarketIdx);
+			const vAsk = calculateAskPrice(market, oracle);
+			const vBid = calculateBidPrice(market, oracle);
 
-			const jitMakerBaseAssetAmount = this.determineJitAuctionBaseFillAmount(
+			let jitMakerPrice =
+				jitMakerDirection == PositionDirection.SHORT
+					? new BN(vAsk.toNumber() + (vAsk.toNumber() - vBid.toNumber()) * 4)
+					: new BN(vBid.toNumber() - (vAsk.toNumber() - vBid.toNumber()) * 4); //nodeToFill.node.order.auctionStartPrice;
+
+			console.log(vAsk.toNumber());
+			console.log(vBid.toNumber());
+			console.log(jitMakerPrice.toNumber());
+			let jitMakerBaseAssetAmount = this.determineJitAuctionBaseFillAmount(
 				nodeToFill.node.order.baseAssetAmount.sub(
 					nodeToFill.node.order.baseAssetAmountFilled
 				),
 				jitMakerPrice
 			);
+			console.log(jitMakerBaseAssetAmount.toNumber());
+			console.log(jitMakerBaseAssetAmount.toNumber());
+			console.log(jitMakerBaseAssetAmount.toNumber());
+			console.log(jitMakerBaseAssetAmount.toNumber());
 
-			const orderSlot = nodeToFill.node.order.slot.toNumber();
-			const currSlot = this.slotSubscriber.getSlot();
-			const aucDur = nodeToFill.node.order.auctionDuration;
-			const aucEnd = orderSlot + aucDur;
+			let orderSlot = nodeToFill.node.order.slot.toNumber();
+			let currSlot = await this.slotSubscriber.getSlot();
+			let aucDur = nodeToFill.node.order.auctionDuration;
+			let aucEnd = orderSlot + aucDur;
+			let diff = (currSlot - orderSlot) / aucDur;
 
-			logger.info(
-				`${
-					this.name
-				} propose to fill jit auction on market ${orderMarketIdx}: ${JSON.stringify(
-					jitMakerDirection
-				)}: ${convertToNumber(jitMakerBaseAssetAmount, BASE_PRECISION).toFixed(
-					4
-				)}, limit price: ${convertToNumber(
-					jitMakerPrice,
-					PRICE_PRECISION
-				).toFixed(4)}, it has been ${
-					currSlot - orderSlot
-				} slots since order, auction ends in ${aucEnd - currSlot} slots`
-			);
+			logger.info(currSlot - orderSlot);
+			console.log(diff);
+			if (diff < -0.9) {
+				nodeToFill.node.haveFilled = false;
 
-			try {
-				const txSig = await this.executeAction({
-					baseAssetAmount: jitMakerBaseAssetAmount,
-					marketIndex: nodeToFill.node.order.marketIndex,
-					direction: jitMakerDirection,
-					price: jitMakerPrice,
-					node: nodeToFill.node,
-				});
-
-				this.metrics?.recordFilledOrder(
-					this.clearingHouse.provider.wallet.publicKey,
-					this.name
-				);
+				//return await this.drawAndExecuteAction(market)
+			} else {
 				logger.info(
 					`${
 						this.name
-					}: JIT auction filled (account: ${nodeToFill.node.userAccount.toString()} - ${nodeToFill.node.order.orderId.toString()}), Tx: ${txSig}`
-				);
-				return txSig;
-			} catch (error) {
-				nodeToFill.node.haveFilled = false;
-
-				// If we get an error that order does not exist, assume its been filled by somebody else and we
-				// have received the history record yet
-				// TODO this might not hold if events arrive out of order
-				const errorCode = getErrorCode(error);
-				this.metrics?.recordErrorCode(
-					errorCode,
-					this.clearingHouse.provider.wallet.publicKey,
-					this.name
+					} propose to fill jit auction on market ${orderMarketIdx}: ${JSON.stringify(
+						jitMakerDirection
+					)}: ${convertToNumber(
+						jitMakerBaseAssetAmount,
+						BASE_PRECISION
+					).toFixed(4)}, limit price: ${convertToNumber(
+						jitMakerPrice,
+						PRICE_PRECISION
+					).toFixed(4)}, it has been ${
+						currSlot - orderSlot
+					} slots since order, auction ends in ${aucEnd - currSlot} slots`
 				);
 
-				logger.error(
-					`Error (${errorCode}) filling JIT auction (account: ${nodeToFill.node.userAccount.toString()} - ${nodeToFill.node.order.orderId.toString()})`
-				);
+				try {
+					const txSig = await this.executeAction({
+						baseAssetAmount: jitMakerBaseAssetAmount,
+						marketIndex: nodeToFill.node.order.marketIndex,
+						direction: jitMakerDirection,
+						price: jitMakerPrice,
+						node: nodeToFill.node,
+					});
 
-				/* todo remove this, fix error handling
+					this.metrics?.recordFilledOrder(
+						this.clearingHouse.provider.wallet.publicKey,
+						this.name
+					);
+					logger.info(
+						`${
+							this.name
+						}: JIT auction filled (account: ${nodeToFill.node.userAccount.toString()} - ${nodeToFill.node.order.orderId.toString()}), Tx: ${txSig}`
+					);
+					return txSig;
+				} catch (error) {
+					console.log(error);
+					nodeToFill.node.haveFilled = false;
+
+					// If we get an error that order does not exist, assume its been filled by somebody else and we
+					// have received the history record yet
+					// TODO this might not hold if events arrive out of order
+					const errorCode = getErrorCode(error);
+					this.metrics?.recordErrorCode(
+						errorCode,
+						this.clearingHouse.provider.wallet.publicKey,
+						this.name
+					);
+
+					logger.error(
+						`Error (${errorCode}) filling JIT auction (account: ${nodeToFill.node.userAccount.toString()} - ${nodeToFill.node.order.orderId.toString()})`
+					);
+
+					/* todo remove this, fix error handling
 				if (errorCode === 6042) {
 					this.dlob.remove(
 						nodeToFill.node.order,
@@ -534,34 +589,14 @@ export class JitMakerBot implements Bot {
 				}
 				*/
 
-				// console.error(error);
+					// console.error(error);
+				}
 			}
 		}
 	}
 
 	private async executeAction(action: Action): Promise<TransactionSignature> {
 		const currentState = this.agentState.stateType.get(action.marketIndex);
-
-		if (this.RESTRICT_POSITION_SIZE) {
-			if (
-				currentState === StateType.CLOSING_LONG &&
-				action.direction === PositionDirection.LONG
-			) {
-				logger.info(
-					`${this.name}: Skipping long action on market ${action.marketIndex}, since currently CLOSING_LONG`
-				);
-				return;
-			}
-			if (
-				currentState === StateType.CLOSING_SHORT &&
-				action.direction === PositionDirection.SHORT
-			) {
-				logger.info(
-					`${this.name}: Skipping short action on market ${action.marketIndex}, since currently CLOSING_SHORT`
-				);
-				return;
-			}
-		}
 
 		const takerUserAccount = (
 			await this.userMap.mustGet(action.node.userAccount.toString())
@@ -573,30 +608,184 @@ export class JitMakerBot implements Bot {
 		);
 		const takerUserStatsPublicKey = takerUserStats.userStatsAccountPublicKey;
 		const referrerInfo = takerUserStats.getReferrerInfo();
-
-		return await this.clearingHouse.placeAndMakePerpOrder(
-			{
-				orderType: OrderType.LIMIT,
-				marketIndex: action.marketIndex,
-				baseAssetAmount: action.baseAssetAmount,
-				direction: action.direction,
-				price: action.price,
-				postOnly: true,
-				immediateOrCancel: true,
-			},
-			{
-				taker: action.node.userAccount,
-				order: action.node.order,
-				takerStats: takerUserStatsPublicKey,
-				takerUserAccount: takerUserAccount,
-			},
-			referrerInfo
+		// total: 6548.327280202056 60.205416666666665 mins
+		let borrowing =
+			action.baseAssetAmount.toNumber() > 0
+				? convertToNumber(action.baseAssetAmount, BASE_PRECISION) *
+				  convertToNumber(action.price, PRICE_PRECISION) *
+				  10 ** 6
+				: -1 *
+				  convertToNumber(action.baseAssetAmount, BASE_PRECISION) *
+				  convertToNumber(action.price, PRICE_PRECISION) *
+				  10 ** 6;
+		if (borrowing < 0) {
+			borrowing = borrowing * -1;
+		}
+		console.log(Math.ceil(borrowing));
+		console.log(Math.ceil(borrowing));
+		console.log(Math.ceil(borrowing));
+		console.log(Math.ceil(borrowing));
+		this.total += borrowing / 10 ** 6;
+		console.log(
+			'total: ' +
+				this.total.toString() +
+				' ' +
+				((new Date().getTime() - this.start) / 1000 / 60).toString() +
+				' mins'
 		);
+		const me = Keypair.fromSecretKey(
+			new Uint8Array(JSON.parse('[' + process.env.KEEPER_PRIVATE_KEY + ']'))
+		);
+		console.log(action.baseAssetAmount.toNumber());
+		console.log(action.baseAssetAmount.toNumber());
+		console.log(action.baseAssetAmount.toNumber());
+		console.log(action.baseAssetAmount.toNumber());
+		//		const accountService = new AccountService(this.clearingHouse.connection);
+		// reserve =await accountService.getReserveInfo(new PublicKey("8qow5YNnT9NfvxVsxYMiKV4ddggT5gEe3uLUvjQ6uYaZ"))
+		let twofiddy = parseFloat(
+			(
+				await this.clearingHouse.connection.getTokenAccountBalance(
+					new PublicKey('Ho9gUv6Y5KKZzxat5pbnf2skppcVpniss6zrabhWwi1n')
+				)
+			).value.amount
+		);
+		//let twofiddy = 198 * 10 ** 6
+		if (borrowing >= twofiddy) {
+			let diff = borrowing / twofiddy;
+			console.log(diff);
+			let hmm = new BN(Math.floor(action.baseAssetAmount.toNumber() / diff));
+			action.baseAssetAmount = this.determineJitAuctionBaseFillAmount(
+				hmm,
+				action.price
+			);
+			borrowing = twofiddy;
+		} /*
+		const [token] = PublicKey.findProgramAddressSync(
+            [me.publicKey.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), (new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")).toBuffer()],
+            ASSOCIATED_TOKEN_PROGRAM_ID
+        );*/
+
+		if (borrowing <= twofiddy && borrowing >= 10 * 10 ** 6) {
+			let jaregm = new PublicKey(
+				'HDuQnmkrezSY5FcPaERXA7pfnHSXDBYr5qMHd8CrwVRx'
+			);
+			console.log(action.price.toNumber());
+			try {
+				return '';
+				/*
+				await this.clearingHouse.txSender.send(
+					new Transaction()
+						// this probably works
+						// and now; magik
+						.add(
+							flashBorrowReserveLiquidityInstruction(
+								Math.ceil(borrowing),
+								new PublicKey(reserve.config.liquidityAddress),
+								new PublicKey('dNwoCR9f1cbk52ansXiR18sxJgr5JFcA1bPYa7Gjsj7'),
+								new PublicKey(reserve.config.address),
+								new PublicKey(this.market.config.address),
+								SOLEND_PRODUCTION_PROGRAM_ID
+							)
+						
+						//reserve.flashBorrow(BigInt(Math.ceil( borrowing)), token),
+						)
+						
+						.add(
+							await this.clearingHouse.getDepositInstruction(
+								new BN(Math.ceil(borrowing)),
+								action.marketIndex,
+								new PublicKey('dNwoCR9f1cbk52ansXiR18sxJgr5JFcA1bPYa7Gjsj7')
+							)
+						)
+						.add(
+							await this.clearingHouse.getPlaceAndMakePerpOrderIx(
+								{
+									orderType: OrderType.LIMIT,
+									marketIndex: action.marketIndex,
+									baseAssetAmount: action.baseAssetAmount,
+									direction: action.direction,
+									price: action.price,
+									postOnly: true,
+									immediateOrCancel: true,
+								},
+								{
+									taker: action.node.userAccount,
+									order: action.node.order,
+									takerStats: takerUserStatsPublicKey,
+									takerUserAccount: takerUserAccount,
+								},
+								referrerInfo
+							)
+						)
+						.add(
+							await this.clearingHouse.getWithdrawIx(
+								new BN(Math.ceil(borrowing) * 1.00000005),
+								action.marketIndex,
+								new PublicKey('dNwoCR9f1cbk52ansXiR18sxJgr5JFcA1bPYa7Gjsj7')
+							)
+						)
+						.add(
+							flashRepayReserveLiquidityInstruction(
+								Math.ceil(borrowing),
+								0,
+								new PublicKey('dNwoCR9f1cbk52ansXiR18sxJgr5JFcA1bPYa7Gjsj7'),
+								new PublicKey(reserve.config.liquidityAddress),
+								new PublicKey(reserve.config.liquidityAddress), //liquidityFeeReceiverAddress),
+								new PublicKey('dNwoCR9f1cbk52ansXiR18sxJgr5JFcA1bPYa7Gjsj7'),
+								new PublicKey(reserve.config.address),
+								new PublicKey(this.market.config.address),
+								me.publicKey,
+								SOLEND_PRODUCTION_PROGRAM_ID,
+								jaregm,
+								new PublicKey(reserve.config.liquidityToken.mint)
+							)
+							//reserve.flashRepay(BigInt(Math.ceil(borrowing)), token, me.publicKey),
+
+						),
+					[me]
+				)
+				 
+				
+			).txSig;
+			*/
+			} catch (err) {
+				this.reset();
+				this.startIntervalLoop(1000);
+			}
+		}
+		return '';
 	}
 
 	private async tryMakeJitAuctionForMarket(market: PerpMarketAccount) {
 		await this.updateAgentState();
-		await this.drawAndExecuteAction(market);
+
+		// get nodes available to fill in the jit auction
+		const nodesToFill = this.dlob.findJitAuctionNodesToFill(
+			market.marketIndex,
+			await this.slotSubscriber.getSlot(),
+			MarketType.PERP
+		);
+		let bad = false;
+		let currSlot = await this.slotSubscriber.getSlot();
+		for (const nodeToFill of nodesToFill) {
+			let orderSlot = nodeToFill.node.order.slot.toNumber();
+			let aucDur = nodeToFill.node.order.auctionDuration;
+			let aucEnd = orderSlot + aucDur;
+			let diff = (currSlot - orderSlot) / aucDur;
+			console.log;
+			if (diff > -0.9) {
+			} else {
+				bad = true;
+			}
+		}
+		if (!bad) {
+			await this.drawAndExecuteAction(market);
+			//	await this.updateAgentState();
+			//			await this.tryMakeJitAuctionForMarket(market)
+		} else {
+			//	await this.updateAgentState();
+			//		await this.tryMakeJitAuctionForMarket(market)
+		}
 	}
 
 	private async tryMake() {
@@ -610,6 +799,13 @@ export class JitMakerBot implements Bot {
 						delete this.dlob;
 					}
 					this.dlob = new DLOB();
+					/*
+					const initPromises: Array<Promise<any>> = [];
+
+					for (const user of this.userMap.values() ){
+						initPromises.push((user.subscribe()))
+					}
+					await Promise.all(initPromises); */
 					await this.dlob.initFromUserMap(this.userMap);
 				});
 
